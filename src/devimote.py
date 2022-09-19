@@ -7,6 +7,7 @@
 import socket
 import struct
 import math as m
+import paho.mqtt.client as mqtt
 
 from kivy.app import App
 from kivy.properties import ObjectProperty # pylint: disable=no-name-in-module
@@ -92,6 +93,22 @@ class DeviMoteBackEnd():
         self.status['connected'] = False
         self.status['crc_ok'] = False
         self.packet_cnt = 0
+        self.dictbyte8={
+	       0:0x00,
+	       1:0x3f,
+	       2:0x40,
+	       3:0x40,
+	       4:0x40,
+	       5:0x40,
+	       14:0x41}
+        self.dictbyte9={
+	       0:0x00,
+	       1:0x80,
+	       2:0x00,
+	       3:0x40,
+	       4:0x80,
+	       5:0xa0,
+	       14:0x60}
 
     def _send_command(self, data: bytearray):
         '''Internal function that builds and transmits a UDP packet command to the amplifier'''
@@ -159,11 +176,13 @@ class DeviMoteBackEnd():
         data = bytearray(142)
         data[6] = 0x00
         data[7] = 0x05
-        data[8] = (out_val & 0xff00) >> 8
-        if output > 7:
-            data[9] = (out_val & 0x00ff) >> 1
-        else:
-            data[9] = (out_val & 0x00ff)
+#        data[8] = (out_val & 0xff00) >> 8
+#        if output > 7:
+#            data[9] = (out_val & 0x00ff) >> 1
+#        else:
+#            data[9] = (out_val & 0x00ff)
+        data[8] = self.dictbyte8.get(output)
+        data[9] = self.dictbyte9.get(output)
         self._send_command(data)
 
     def update(self):
@@ -185,10 +204,14 @@ class DeviMoteBackEnd():
             enabled = int(chr(data[52+i*17]))
             if enabled:
                 self.status['ch_list'][i] = data[53+i*17:52+(i+1)*17].decode('UTF-8')
-        self.status['power']   = (data[307] & 0x80) != 0
-        self.status['muted']   = (data[308] & 0x2) != 0
-        self.status['channel'] = (data[308] & 0x3c) >> 2
-        self.status['volume']  =  data[310]
+#        self.status['power']   = (data[307] & 0x80) != 0
+#        self.status['muted']   = (data[308] & 0x2) != 0
+#        self.status['channel'] = (data[308] & 0x3c) >> 2
+#        self.status['volume']  =  data[310]
+        self.status['power']   = (data[562] & 0x80) != 0
+        self.status['muted']   = (data[563] & 0x2) != 0
+        self.status['channel'] = (data[563] & 0x3c) >> 2
+        self.status['volume']  =  data[565]
         self.status['crc_ok']  = (_crc16(data[:-2]) == struct.unpack('>H',data[-2:])[0])
 
         return self.status
@@ -232,6 +255,51 @@ class DeviMoteApp(App):
                 break
         if output != self.status['channel']:
             self.backend.set_output(output)
+            
+    def set_output_callback_by_number(self, _instance, number): 
+         '''Added as an expedient because I had trouble writing the code for calling by name'''
+         self.backend.set_output(number)
+
+    def on_connect(self,client, userdata, flags, rc):
+         ''' MQTT handling, confirm coonection, unused at this time '''
+            print("Connected with result code "+str(rc))
+            client.subscribe("$SYS/#")
+
+    def on_message(self,client,userdata,message):
+         ''' MQTT, trigger callbacks associated with incoming message (topic + payload)
+        if  (message.topic == "Devimote/Power/cmd"): # payload irrelevant for toggle command
+            self.toggle_power_callback(self)
+        elif (message.topic == "Devimote/Mute/cmd"): # payload irrelevant for toggle command
+            self.toggle_mute_callback(self)           
+        elif (message.topic == "Devimote/Volume/cmd"):
+            val = message.payload.decode()           # payload is volume requested
+            fval = float(val)
+            self.set_volume_callback(self,fval)
+        elif(message.topic == "Devimote/Source/cmd"):
+            text = message.payload                  # payload is source (number) requested
+            number = int(text)
+            self.set_output_callback_by_number(self, number)
+
+    def mqtt_update(self,status):
+       ''' MQTT outgoing messages for updates updates (in parallel with gui) '''
+       if status and status['connected']:
+           self.mqtt_client.publish("Devimote/Connect","Connected")
+           if status['power']:
+                self.mqtt_client.publish("Devimote/Power","ON")
+           elif status['booting']:
+                self.mqtt_client.publish("Devimote/Power","BOOTING")
+           else:
+                self.mqtt_client.publish("Devimote/Power","STANDBY")
+           if status['muted']:
+                self.mqtt_client.publish("Devimote/Mute","UNMUTE")
+           else:
+                self.mqtt_client.publish("Devimote/Mute","MUTE")
+           vol = (status['volume'] - 195) / 2
+           self.mqtt_client.publish("Devimote/Volume", vol)
+           self.mqtt_client.publish("Devimote/Source", status['channel'])
+       else:
+           self.mqtt_client.publish("Devimote/Connect","Not connected")
+
 
     def build(self):
         '''Kivy build function, runs once'''
@@ -244,6 +312,14 @@ class DeviMoteApp(App):
         self.gui.sw_mute.bind(on_press=self.toggle_mute_callback)
         self.gui.volume.vol_slider.bind(value=self.set_volume_callback)
         self.gui.channels.bind(text=self.set_output_callback)
+        self.mqtt_client = mqtt.Client("Devimote")        # instantiate mqtt client
+        self.gui.mqtt_client = self.mqtt_client
+        self.mqtt_client.on_message = self.on_message     # call function on_message when incoming
+        self.mqtt_client.onconnect = self.on_connect          
+        self.BROKER_ADDRESS='127.0.0.1'
+        self.mqtt_client.connect(self.BROKER_ADDRESS)     # connect mqtt client to local mqtt broker
+        self.mqtt_client.subscribe("Devimote/#")          # subscribe to all messages with main topic "Devimote"
+        self.mqtt_client.loop_start()                     # mqtt client will loop in separate thread
         Clock.schedule_interval(self.update, 0.1)
         return self.gui
 
@@ -253,6 +329,7 @@ class DeviMoteApp(App):
         if self.status['power']:
             self._powered(0)
         self.gui.update(self.status)
+        self.mqtt_update(self.status)    # update status through outgoing mqtt messages  
 
     def report(self):
         '''Pretty-print current status'''
